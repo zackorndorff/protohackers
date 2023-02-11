@@ -1,0 +1,131 @@
+$ nc vcs.protohackers.com 30307
+READY
+help
+OK usage: HELP|GET|PUT|LIST
+READY
+LIST
+ERR usage: LIST dir
+READY
+LIST .
+ERR illegal dir name
+LIST /
+OK 0
+READY
+PUT
+ERR usage: PUT file length newline data
+READY
+GET
+ERR usage: GET file [revision]
+READY
+PUT hello 2
+ERR illegal file name
+PUT /hello 2
+a
+OK r1
+READY
+PUT /hello 2
+b
+OK r2
+READY
+GET /hello
+OK 2
+b
+READY
+GET /hello 1
+OK 2
+a
+READY
+GET /hello 3
+ERR no such revision
+READY
+GET /hello 0
+ERR no such revision
+READY
+
+$ nc vcs.protohackers.com 30307
+READY
+PUT /hello/../world 2
+a
+OK r1
+READY
+GET /world
+ERR no such file
+READY
+GET /hello/../world
+OK 2
+a
+READY
+
+
+
+
+
+
+$ nc vcs.protohackers.com 30307
+READY
+PUT /a/ 2
+ERR illegal file name
+PUT /a 2
+a
+OK r1
+READY
+PUT /a/b 2
+b
+OK r1
+READY
+LIST /
+OK 1
+a r1
+READY
+LIST /a
+OK 1
+b r1
+READY
+LIST /a/b
+OK 0
+READY
+
+
+
+$ nc vcs.protohackers.com 30307
+READY
+PUT /dir1/dir2/filename 2
+a
+OK r1
+READY
+LIST /dir1
+OK 1
+dir2/ DIR
+READY
+PUT /dir1 2
+f
+OK r1
+READY
+LIST /dir1
+OK 1
+dir2/ DIR
+READY
+LIST /
+OK 1
+dir1 r1
+READY
+PUT /dir1/dir2
+ERR usage: PUT file length newline data
+READY
+PUT /dir1/dir2 2
+a
+OK r1
+READY
+LIST /dir1
+OK 1
+dir2 r1
+READY
+
+
+
+$ nc vcs.protohackers.com 30307
+READY
+asdf
+ERR illegal method: asdf
+
+took 4s

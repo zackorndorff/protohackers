@@ -1,0 +1,240 @@
+package main
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"reflect"
+	"strings"
+
+	"z10f.com/golang/protohackers/06/core"
+)
+
+//const TIMEOUT_SECONDS = 5
+//const MAX_REQUESTS = 1_000_000
+//const MSG_LEN = 9
+//conn.SetReadDeadline(time.Now().Add(TIMEOUT_SECONDS * time.Second))
+// log.Println("Handling request from", conn.RemoteAddr())
+
+type MsgType int
+
+const (
+	MsgTypeError         MsgType = 0x10
+	MsgTypePlate         MsgType = 0x20
+	MsgTypeTicket        MsgType = 0x21
+	MsgTypeWantHeartbeat MsgType = 0x40
+	MsgTypeHeartbeat     MsgType = 0x41
+	MsgTypeIAmCamera     MsgType = 0x80
+	MsgTypeIAmDispatcher MsgType = 0x81
+)
+
+type MsgError struct {
+	Msg string
+}
+
+type MsgPlate struct {
+	Plate     string
+	Timestamp uint32
+}
+
+type MsgWantHeartbeat struct {
+	Interval uint32
+}
+
+type MsgHeartbeat struct {
+}
+
+type MsgIAmCamera struct {
+	Road  uint16
+	Mile  uint16
+	Limit uint16 // mph
+}
+
+type MsgIAmDispatcher struct {
+	NumRoads uint8 `zmarshal:"length:Roads"`
+	Roads    []uint16
+}
+
+type SerializedString struct {
+	Len  uint8 `zmarshal:"length:Data"`
+	Data []uint8
+}
+
+func (ss *SerializedString) String() string {
+	// TODO make this actually ASCII
+	return string(ss.Data)
+}
+
+type Unmarshaller struct {
+	MessageTypes map[MsgType]reflect.Type
+	StringType   reflect.Type
+}
+
+func NewUnmarshaller() *Unmarshaller {
+	types := make(map[MsgType]reflect.Type)
+	types[MsgTypePlate] = reflect.TypeOf((*MsgPlate)(nil))
+	types[MsgTypeWantHeartbeat] = reflect.TypeOf((*MsgWantHeartbeat)(nil))
+	types[MsgTypeIAmCamera] = reflect.TypeOf((*MsgIAmCamera)(nil))
+	types[MsgTypeIAmDispatcher] = reflect.TypeOf((*MsgIAmDispatcher)(nil))
+	return &Unmarshaller{
+		MessageTypes: types,
+		StringType:   reflect.TypeOf((*SerializedString)(nil)).Elem(),
+	}
+}
+
+var ErrCouldntRead = errors.New("could not read full message from client")
+var ErrInvalidMsgType = errors.New("message type not valid")
+var ErrInvalidLengthOf = errors.New("length tag was set on a non-uint field")
+var ErrNoSizeForSlice = errors.New("no size provided for slice member of struct")
+
+type UnmarshalState struct {
+	KnownLengths map[string]int
+	Unmarshaller *Unmarshaller
+}
+
+func (u *UnmarshalState) Unmarshal(r io.Reader, t reflect.Type, size *int) (interface{}, error) {
+	log.Println("t was", t)
+	log.Println("Unmarshalling kind", t.Kind())
+	switch t.Kind() {
+	case reflect.Pointer:
+		elemType := t.Elem()
+		val, err := u.Unmarshal(r, elemType, nil)
+		if err != nil {
+			return nil, err
+		}
+		return &val, nil
+
+	case reflect.String:
+		{
+			log.Println("string type is", u.Unmarshaller.StringType)
+			val, err := u.Unmarshal(r, u.Unmarshaller.StringType, nil)
+			if err != nil {
+				return nil, err
+			}
+			return val.(fmt.Stringer).String(), nil
+		}
+	case reflect.Uint32:
+		fallthrough
+	case reflect.Uint16:
+		fallthrough
+	case reflect.Uint8:
+		crap := reflect.New(t)
+		err := binary.Read(r, binary.BigEndian, crap.Interface())
+		if err != nil {
+			log.Println("error was", err)
+			return nil, ErrCouldntRead
+		}
+		return reflect.Indirect(crap).Interface(), nil
+	case reflect.Struct:
+		crap := reflect.Indirect(reflect.New(t))
+		fieldCount := crap.NumField()
+		newus := &UnmarshalState{
+			KnownLengths: make(map[string]int),
+			Unmarshaller: u.Unmarshaller,
+		}
+		for i := 0; i < fieldCount; i++ {
+			f := crap.Field(i)
+			ftype := t.Field(i)
+			tag := ftype.Tag.Get("zmarshal")
+			var lengthof string
+			if strings.HasPrefix(tag, "length:") {
+				lengthof = tag[len("length:"):]
+				log.Println("this field is the length of", lengthof)
+				if !f.CanUint() {
+					return nil, ErrInvalidLengthOf
+				}
+			}
+			var size *int
+			if knownLen, ok := newus.KnownLengths[ftype.Name]; ok {
+				size = &knownLen
+			}
+			value, err := newus.Unmarshal(r, f.Type(), size)
+			if err != nil {
+				return nil, err
+			}
+			f.Set(reflect.ValueOf(value))
+			if lengthof != "" {
+				newus.KnownLengths[lengthof] = int(f.Uint())
+				log.Printf("Known length for %s is %d", lengthof, uint64(f.Uint()))
+			}
+		}
+		return crap.Interface(), nil
+	case reflect.Slice:
+		{
+			if size == nil {
+				return nil, ErrNoSizeForSlice
+			}
+			crapArrType := reflect.ArrayOf(*size, t.Elem())
+			value, err := u.Unmarshal(r, crapArrType, nil)
+			if err != nil {
+				return nil, err
+			}
+			crap := reflect.ValueOf(value).Slice(0, *size)
+			return crap, nil
+		}
+	case reflect.Array:
+		{
+			crapArr := reflect.Indirect(reflect.New(t))
+			elemType := t.Elem()
+			for i := 0; i < crapArr.Len(); i++ {
+				f := crapArr.Index(i)
+				value, err := u.Unmarshal(r, elemType, nil)
+				if err != nil {
+					return nil, err
+				}
+				f.Set(reflect.ValueOf(value))
+			}
+			return crapArr.Interface(), nil
+		}
+	default:
+		return nil, fmt.Errorf("unmarshal: unsupported kind %s", t.Kind())
+	}
+}
+
+func (u *Unmarshaller) UnmarshalMessage(r io.Reader) (interface{}, error) {
+	var msgType uint8
+	err := binary.Read(r, binary.BigEndian, &msgType)
+	if err != nil {
+		log.Println(err)
+		return nil, ErrCouldntRead
+	}
+
+	msgStructType, ok := u.MessageTypes[MsgType(msgType)]
+	if !ok {
+		return nil, ErrInvalidMsgType
+	}
+
+	us := &UnmarshalState{
+		KnownLengths: make(map[string]int),
+		Unmarshaller: u,
+	}
+
+	return us.Unmarshal(r, msgStructType, nil)
+}
+
+func handleConnection(conn net.Conn, state *core.State) {
+	log.Println("Handling connection from", conn.RemoteAddr())
+}
+
+func main() {
+	state := core.NewState()
+	go state.MainLoop()
+
+	l, err := net.Listen("tcp", ":1337")
+	if err != nil {
+		log.Fatal("could not listen", err)
+	}
+	defer l.Close()
+	fmt.Println("Listening.")
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			log.Println("Error accepting", err)
+		}
+		go handleConnection(conn, state)
+	}
+}
+
